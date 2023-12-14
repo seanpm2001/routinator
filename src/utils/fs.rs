@@ -48,10 +48,12 @@ impl ExclusiveFile {
     fn _open(path: &Path) -> Result<Self, io::Error> {
         use std::os::windows::fs::OpenOptionsExt;
 
-        OpenOptions::new()
-            .read(true).write(true).create(true)
-            .share_mode(0) // 0 means: don’t share with other processes.
-            .open(path)
+        Ok(Self {
+            file: OpenOptions::new()
+                .read(true).write(true).create(true)
+                .share_mode(0) // 0 means: don’t share with other processes.
+                .open(path)?
+        })
     }
 
     #[cfg(not(windows))]
