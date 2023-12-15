@@ -2,6 +2,7 @@
 //!
 //! This is a private module. It’s types are re-exported by the parent.
 
+use std::io;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use crate::config::{Config, FallbackPolicy};
 use crate::error::{Failed, Fatal, RunFailed};
 use crate::metrics::Metrics;
 use crate::engine::CaCert;
+use crate::utils::binio::ParseError;
 use super::{rrdp, rsync};
 
 
@@ -149,13 +151,14 @@ impl<'a> Run<'a> {
     ///
     /// If you are not interested in the metrics, you can simply drop the
     /// value, instead.
-    pub fn done(self, metrics: &mut Metrics) {
+    pub fn done(self, metrics: &mut Metrics) -> StoredStatus {
         if let Some(rrdp) = self.rrdp {
             rrdp.done(metrics)
         }
         if let Some(rsync) = self.rsync {
             rsync.done(metrics)
         }
+        StoredStatus(())
     }
 
     /// Loads the trust anchor certificate at the given URI.
@@ -358,6 +361,36 @@ impl Cleanup {
     /// Registers an rsync module to be retained in cleanup.
     pub fn add_rsync_module(&mut self, uri: &uri::Rsync) {
         self.rsync.add_from_uri(uri);
+    }
+}
+
+
+//------------ StoredStatus --------------------------------------------------
+
+/// The content of the collector’s status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredStatus(());
+
+impl StoredStatus {
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        StoredStatus(())
+    }
+
+    pub fn is_current(&self, _collector: &Collector) -> bool {
+        true
+    }
+
+    pub fn read(
+        _reader: &mut impl io::Read
+    ) -> Result<Self, ParseError> {
+        Ok(Self(()))
+    }
+
+    pub fn write(
+        &self, _writer: &mut impl io::Write
+    ) -> Result<(), io::Error> {
+        Ok(())
     }
 }
 

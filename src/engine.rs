@@ -18,14 +18,16 @@
 /// the accompanying trait [`ProcessPubPoint`] dealing with individual
 /// publication points.
 
-use std::{fmt, fs, thread};
+use std::{fmt, fs, io, thread};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use bytes::Bytes;
+use chrono::{DateTime, TimeZone, Utc};
 use crossbeam_queue::{ArrayQueue, SegQueue};
 use log::{debug, error, info, warn};
 use rpki::crypto::keys::KeyIdentifier;
@@ -48,7 +50,10 @@ use crate::metrics::{
     Metrics, PublicationMetrics, RepositoryMetrics, TalMetrics
 };
 use crate::store::{Store, StoredManifest, StoredObject, StoredPoint};
+use crate::utils::binio::{Compose, Parse, ParseError};
+use crate::utils::fs::ExclusiveFile;
 use crate::utils::str::str_from_ascii;
+use crate::utils::sync::Mutex;
 
 
 //------------ Configuration -------------------------------------------------
@@ -100,6 +105,9 @@ pub struct Engine {
 
     /// The store to load stored data from.
     store: Store,
+
+    /// The path to the status file.
+    status_path: PathBuf,
 
     /// Should we be strict when decoding data?
     strict: bool,
@@ -155,6 +163,7 @@ impl Engine {
             tals: Vec::new(),
             collector,
             store,
+            status_path: config.cache_dir.join("status.bin"),
             strict: config.strict,
             stale: config.stale,
             validation_threads: config.validation_threads,
@@ -293,20 +302,29 @@ impl Engine {
     /// During the run, `processor` will be responsible for dealing with
     /// valid objects. It must implement the [`ProcessRun`] trait.
     ///
+    /// If `last_updated` is not `None`, it specifies a duration since the
+    /// last successful validation run before which a new update should be
+    /// attempted. Ie., if the last validation run was successful, is
+    /// compatible with the current configuration, and was less than the
+    /// duration ago, only the already stored data is used.
+    ///
     /// The method returns a [`Run`] that drives the validation run.
     pub fn start<P: ProcessRun>(
-        &self, processor: P
-    ) -> Result<Run<P>, Failed> {
+        &self,
+        processor: P,
+        last_updated: Option<Duration>,
+    ) -> Result<Run<P>, RunFailed> {
         info!("Using the following TALs:");
         for tal in &self.tals {
             info!("  * {}", tal.info().name());
         }
-        Ok(Run::new(
+        Run::new(
             self,
             self.collector.as_ref().map(Collector::start),
             self.store.start(),
+            last_updated,
             processor
-        ))
+        )
     }
 
     /// Dumps the content of the collector and store owned by the engine.
@@ -341,6 +359,12 @@ pub struct Run<'a, P> {
     /// The processor for valid data.
     processor: P,
 
+    /// The status file.
+    ///
+    /// We keep it open during the run to avoid someone else starting a
+    /// competing run.
+    status_file: ExclusiveFile,
+
     /// Was an error encountered during the run?
     had_err: AtomicBool,
 
@@ -355,16 +379,57 @@ impl<'a, P> Run<'a, P> {
     /// Creates a new runner from all the parts.
     fn new(
         validation: &'a Engine,
-        collector: Option<collector::Run<'a>>,
+        mut collector: Option<collector::Run<'a>>,
         store: store::Run<'a>,
+        last_updated: Option<Duration>,
         processor: P,
-    ) -> Self {
-        Run {
-            validation, collector, store, processor,
+    ) -> Result<Self, RunFailed> {
+        let mut status_file = ExclusiveFile::open(
+            &validation.status_path
+        ).map_err(|err| {
+            error!(
+                "Fatal: Failed to open store status file '{}': {}",
+                validation.status_path.display(), err
+            );
+            error!(
+                "       Is there another Routinator instance running?"
+            );
+            RunFailed::fatal()
+        })?;
+
+        if let Ok(status) = StoredStatus::read(&mut status_file) {
+            if status.is_current(validation, last_updated) {
+                eprintln!("Store is current, skipping update.");
+                collector = None;
+            }
+        }
+
+        // If we have a collector, the status will change. Clear the status
+        // so that if we crash there isn’t a usable yet possibly incorrect
+        // status.
+        if collector.is_some() {
+            io::Seek::rewind(&mut status_file).map_err(|err| {
+                error!(
+                    "Fatal: Failed to reset store status file '{}': {}",
+                    validation.status_path.display(), err
+                );
+                RunFailed::fatal()
+            })?;
+            status_file.set_len(0).map_err(|err| {
+                error!(
+                    "Fatal: Failed to reset store status file '{}': {}",
+                    validation.status_path.display(), err
+                );
+                RunFailed::fatal()
+            })?;
+        }
+
+        Ok(Run {
+            validation, collector, store, processor, status_file,
             had_err: AtomicBool::new(false),
             is_fatal: AtomicBool::new(false),
             metrics: Default::default()
-        }
+        })
     }
 
     /// Cleans the collector and store owned by the engine.
@@ -386,13 +451,35 @@ impl<'a, P> Run<'a, P> {
     ///
     /// If you are not interested in the metrics, you can simple drop the
     /// value, instead.
-    pub fn done(self) -> Metrics {
+    pub fn done(mut self) -> Result<Metrics, RunFailed> {
         let mut metrics = self.metrics;
-        if let Some(collector) = self.collector {
+        let collector_status = self.collector.map(|collector| {
             collector.done(&mut metrics)
-        }
+        });
         self.store.done(&mut metrics);
-        metrics
+
+        if let Some(collector_status) = collector_status {
+            StoredStatus::new(
+                Utc::now(),
+                self.validation.tals.as_slice(),
+                collector_status,
+            ).write(&mut self.status_file).map_err(|err| {
+                error!(
+                    "Fatal: failed to write store status file '{}': {}",
+                    self.validation.status_path.display(), err
+                );
+                RunFailed::fatal()
+            })?;
+            self.status_file.close().map_err(|err| {
+                error!(
+                    "Fatal: failed to close store status file '{}': {}",
+                    self.validation.status_path.display(), err
+                );
+                RunFailed::fatal()
+            })?;
+        }
+
+        Ok(metrics)
     }
 }
 
@@ -1847,7 +1934,7 @@ impl RunMetrics {
             cert.ca_repository.canonical_module()
         });
 
-        let mut repository_indexes = self.repository_indexes.lock().unwrap();
+        let mut repository_indexes = self.repository_indexes.lock();
         if let Some(index) = repository_indexes.get(uri.as_ref()) {
             return *index
         }
@@ -1878,7 +1965,7 @@ impl RunMetrics {
     /// Prepares the final metrics.
     pub fn prepare_final(&self, target: &mut Metrics) {
         let mut indexes: Vec<_>
-            = self.repository_indexes.lock().unwrap().iter().map(|item| {
+            = self.repository_indexes.lock().iter().map(|item| {
                 (item.0.clone(), *item.1)
             }).collect();
         indexes.sort_by_key(|(_, idx)| *idx);
@@ -2046,6 +2133,161 @@ pub trait ProcessPubPoint: Sized + Send + Sync {
     ///
     /// The default implementation does nothing at all.
     fn cancel(self, _cert: &CaCert) {
+    }
+}
+
+
+//------------ StoredStatus --------------------------------------------------
+
+/// The content of the store’s status.
+///
+/// This type can be used to check whether the last validation run that
+/// updated the store resulted in enough information for doing a run just
+/// from the store.
+///
+/// This requires that the run wasn’t too long ago, that all the TALs we
+/// are using now were included back then as well, and that the collectors
+/// used a compatible configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredStatus {
+    /// When did the last update conclude?
+    updated: DateTime<Utc>,
+
+    /// The public key bits of all the TALs used during the last update.
+    tals: HashSet<Bytes>,
+
+    /// The status of the collectors.
+    collector: collector::StoredStatus,
+}
+
+impl StoredStatus {
+    /// Creates a new stored status object from the contained data.
+    fn new(
+        updated: DateTime<Utc>,
+        tals: &[Tal],
+        collector: collector::StoredStatus,
+    ) -> Self {
+        StoredStatus {
+            updated,
+            tals: tals.iter().map(|tal| tal.key_info().bits_bytes()).collect(),
+            collector,
+        }
+    }
+
+    /// Returns whether data with this status should be considered current.
+    pub fn is_current(
+        &self, engine: &Engine, last_update: Option<Duration>
+    ) -> bool {
+        // If last_update is None, we can never be current.
+        let earliest_update = match last_update {
+            Some(duration) => Utc::now() - duration,
+            None => return false,
+        };
+
+        // If the update is older that last_update, we are not current.
+        if self.updated < earliest_update {
+            return false
+        }
+
+        // If there are TALs configured we didn’t use in the last update,
+        // we are not current.
+        for tal in &engine.tals {
+            if !self.tals.contains(tal.key_info().bits()) {
+                return false
+            }
+        }
+
+        // If we have a collector, it needs to agree, too.
+        if let Some(collector) = engine.collector.as_ref() {
+            if !self.collector.is_current(collector) {
+                return false
+            }
+        }
+
+        // Can’t find any more reasons why we shouldn’t be current.
+        true
+    }
+
+    /// Reads the stored status from an IO reader.
+    pub fn read(
+        reader: &mut impl io::Read
+    ) -> Result<Self, ParseError> {
+        // Version number. Must be 0u8.
+        let version = u8::parse(reader)?;
+        if version != 0 {
+            return Err(ParseError::format(
+                    format!("unexpected version {}", version)
+            ))
+        }
+
+        let updated_ts = i64::parse(reader)?;
+        let updated = match Utc.timestamp_opt(updated_ts, 0).single() {
+            Some(time) => time,
+            None => {
+                return Err(ParseError::format(
+                        format!("invalid update time {}", updated_ts)
+                ));
+            }
+        };
+
+        let tal_len = usize::try_from(u32::parse(reader)?).map_err(|_| {
+            ParseError::format("too many TALs for this system")
+        })?;
+        let mut tals = HashSet::new();
+        for _ in 0..tal_len {
+            tals.insert(Bytes::parse(reader)?);
+        }
+
+        let collector = collector::StoredStatus::read(reader)?;
+
+        Ok(Self { updated, tals, collector })
+    }
+
+    /// Appends the stored status to a writer.
+    pub fn write(
+        &self, writer: &mut impl io::Write
+    ) -> Result<(), io::Error> {
+        // Version: 0u8.
+        0u8.compose(writer)?;
+        self.updated.timestamp().compose(writer)?;
+        u32::try_from(self.tals.len()).map_err(|_|
+            io::Error::new(io::ErrorKind::Other, "excessively large TAL set")
+        )?.compose(writer)?;
+        self.tals.iter().try_for_each(|tal| tal.compose(writer))?;
+        self.collector.write(writer)?;
+
+        Ok(())
+    }
+}
+
+
+//============ Tests =========================================================
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn write_read_stored_status() {
+        fn cycle(
+            tals: impl IntoIterator<Item = &'static str>
+        ) {
+            let orig = StoredStatus {
+                updated: Utc::now(),
+                tals: tals.into_iter().map(Bytes::from).collect(),
+                collector: collector::StoredStatus::new_test(),
+            };
+            let mut written = Vec::new();
+            orig.write(&mut written).unwrap();
+            let decoded = StoredStatus::read(
+                &mut written.as_slice()
+            ).unwrap();
+            assert_eq!(orig, decoded);
+        }
+
+        cycle([]);
+        cycle(["foo", "barbar", ""]);
+        cycle([""]);
     }
 }
 

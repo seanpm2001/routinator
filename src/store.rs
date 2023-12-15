@@ -430,7 +430,7 @@ impl<'a> Run<'a> {
     fn new(
         store: &'a Store,
     ) -> Self {
-        Run { store }
+        Self { store }
     }
 
     /// Finishes the validation run.

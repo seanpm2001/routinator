@@ -17,6 +17,7 @@ use std::cmp;
 use std::collections::hash_map;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use log::{info, warn};
 use rpki::uri;
@@ -94,13 +95,13 @@ impl ValidationReport {
 
     /// Creates a new validation report by running the engine.
     pub fn process(
-        engine: &Engine, config: &Config,
+        engine: &Engine, config: &Config, last_update: Option<Duration>
     ) -> Result<(Self, Metrics), RunFailed> {
         let report = Self::new(config);
-        let mut run = engine.start(&report)?;
+        let mut run = engine.start(&report, last_update)?;
         run.process()?;
         run.cleanup()?;
-        let metrics = run.done();
+        let metrics = run.done()?;
         Ok((report, metrics))
     }
 

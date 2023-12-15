@@ -249,7 +249,15 @@ impl Server {
         validation.ignite()?;
 
         let join = thread::spawn(move || {
+            // On the first iteration we accept old data at most one refresh
+            // cycle old. This will be set to `None` for subsequent
+            // iterations.
+            let mut last_update = Some(process.config().refresh);
+
+            // We only want to retry a run that can be retried once. If it
+            // fails again, something is odd and we should crash.
             let mut can_retry = true;
+
             let err = loop {
                 if let Some(log) = log.as_ref() {
                     log.start();
@@ -260,9 +268,13 @@ impl Server {
                     Ok(exceptions) => {
                         match Self::process_once(
                             process.config(), &validation, &history,
-                            &mut notify, exceptions,
+                            &mut notify, exceptions, last_update.take(),
                         ) {
                             Ok(()) => {
+                                // Succcessful run, so we can go back to
+                                // allowing a single retry-able failure.
+                                can_retry = true;
+
                                 history.read().refresh_wait()
                             }
                             Err(err) => {
@@ -386,10 +398,13 @@ impl Server {
         history: &SharedHistory,
         notify: &mut NotifySender,
         exceptions: LocalExceptions,
+        last_update: Option<Duration>,
     ) -> Result<(), RunFailed> {
         info!("Starting a validation run.");
         history.mark_update_start();
-        let (report, metrics) = ValidationReport::process(engine, config)?;
+        let (report, metrics) = ValidationReport::process(
+            engine, config, last_update
+        )?;
         let must_notify = history.update(
             report, &exceptions, metrics,
         );
@@ -434,6 +449,9 @@ pub struct Vrps {
 
     /// Don’t update the repository.
     noupdate: bool,
+
+    /// Don’t update the cache if it isn’t older than given.
+    last_updated: Option<Duration>,
 
     /// Return an error on incomplete update.
     complete: bool,
@@ -485,9 +503,9 @@ struct VrpsArgs {
     #[arg(long)]
     no_aspas: bool,
 
-    /// Don't update the local cache
-    #[arg(short, long)]
-    noupdate: bool,
+    /// Don't update the local cache (if it is newer than given).
+    #[arg(short, long, value_name = "SECONDS")]
+    noupdate: Option<Option<u64>>,
 
     /// Return an error status on incomplete update
     #[arg(long)]
@@ -559,18 +577,13 @@ impl Vrps {
             path,
             format,
             output,
-            noupdate: args.noupdate,
+            noupdate: matches!(args.noupdate, Some(None)),
+            last_updated: args.noupdate.flatten().map(Duration::from_secs),
             complete: args.complete,
         })
     }
 
     /// Produces a list of Validated ROA Payload.
-    ///
-    /// The list will be written to the file identified by `path` or
-    /// stdout if that is `None`. The format is determined by `format`.
-    /// If `noupdate` is `false`, the local repository will be updated first
-    /// and rsync will be enabled during validation to sync any new
-    /// publication points.
     fn run(mut self, process: Process) -> Result<(), ExitError> {
         self.output.update_from_config(process.config());
         let mut engine = Engine::new(process.config(), !self.noupdate)?;
@@ -582,7 +595,9 @@ impl Vrps {
             let mut once = false;
 
             loop {
-                match ValidationReport::process(&engine, process.config()) {
+                match ValidationReport::process(
+                    &engine, process.config(), self.last_updated,
+                ) {
                     Ok(res) => break res,
                     Err(err) => {
                         if err.should_retry() {
@@ -667,6 +682,9 @@ pub struct Validate {
     /// Don’t update the repository.
     noupdate: bool,
 
+    /// Don’t update the cache if it isn’t older than given.
+    last_updated: Option<Duration>,
+
     /// Return an error on incomplete update.
     complete: bool,
 }
@@ -709,9 +727,9 @@ struct ValidateArgs {
     #[arg(short, long, value_name = "PATH", default_value = "-")]
     output: PathBuf,
 
-    /// Don't update the local cache
-    #[arg(short, long)]
-    noupdate: bool,
+    /// Don't update the local cache (if it is newer than given).
+    #[arg(short, long, value_name = "SECONDS")]
+    noupdate: Option<Option<u64>>,
 
     /// Return an error status on incomplete update
     #[arg(long)]
@@ -770,7 +788,8 @@ impl Validate {
                     Some(args.output)
                 }
             },
-            noupdate: args.noupdate,
+            noupdate: matches!(args.noupdate, Some(None)),
+            last_updated: args.noupdate.flatten().map(Duration::from_secs),
             complete: args.complete,
         })
     }
@@ -852,7 +871,7 @@ impl Validate {
         engine.ignite()?;
         process.switch_logging(false, false)?;
         let (report, mut metrics) = ValidationReport::process(
-            &engine, process.config(),
+            &engine, process.config(), self.last_updated,
         )?;
         let snapshot = report.into_snapshot(
             &LocalExceptions::load(process.config(), false)?,
@@ -1091,7 +1110,7 @@ impl Update {
         engine.ignite()?;
         process.switch_logging(false, false)?;
         let (_, metrics) = ValidationReport::process(
-            &engine, process.config(),
+            &engine, process.config(), None
         )?;
         if self.complete && !metrics.rsync_complete() {
             Err(ExitError::IncompleteUpdate)

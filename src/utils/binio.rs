@@ -6,8 +6,7 @@
 
 use std::{error, fmt, io, slice};
 use bytes::Bytes;
-use rpki::rrdp;
-use rpki::uri;
+use rpki::{rrdp, uri};
 use uuid::Uuid;
 
 
@@ -36,6 +35,23 @@ impl<R: io::Read> Parse<R> for u8 {
         let mut res = 0u8;
         source.read_exact(slice::from_mut(&mut res))?;
         Ok(res)
+    }
+}
+
+
+//------------ u16 -----------------------------------------------------------
+
+impl<W: io::Write> Compose<W> for u16 {
+    fn compose(&self, target: &mut W) -> Result<(), io::Error> {
+        target.write_all(&self.to_be_bytes())
+    }
+}
+
+impl<R: io::Read> Parse<R> for u16 {
+    fn parse(source: &mut R) -> Result<Self, ParseError> {
+        let mut res = 0u16.to_ne_bytes();
+        source.read_exact(&mut res)?;
+        Ok(u16::from_be_bytes(res))
     }
 }
 

@@ -33,13 +33,16 @@ pub struct ExclusiveFile {
 impl ExclusiveFile {
     /// Opens an exclusive file.
     ///
-    /// Opens the file specified by `path` for reading and writing and blocks
-    /// access to it by other processes and possibly re-opening it by the same
-    /// process again, too. If the file doesn’t exist, it will be created.
+    /// Trys to Open the file specified by `path` for reading and writing and
+    /// blocks access to it by other processes and possibly re-opening it by
+    /// the same process again, too. If the file doesn’t exist, it will be
+    /// created.
     ///
-    /// Returns an error if opening fails. Because there is no portable way
-    /// to indicate opening failing because of an already locked file, this
-    /// will always just be a generic IO error.
+    /// If the file has already been opened exclusively, the function will
+    /// fail and return an error. Because there is no portable way
+    /// to indicate this error case, a generic IO error will be returned.
+    ///
+    /// An error is also returned if opening fails for other reasons.
     pub fn open(path: &Path) -> Result<Self, io::Error> {
         Self::_open(path)
     }
@@ -67,7 +70,7 @@ impl ExclusiveFile {
         let _ = nix::fcntl::fcntl(
             file.as_raw_fd(),
             nix::fcntl::FcntlArg::F_SETLK(&nix::libc::flock {
-                l_type: (nix::libc::F_RDLCK | nix::libc::F_WRLCK) as c_short,
+                l_type:  nix::libc::F_WRLCK as c_short,
                 l_whence: nix::libc::SEEK_SET as c_short,
                 l_start: 0,
                 l_len: 0,
